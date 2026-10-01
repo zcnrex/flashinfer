@@ -38,6 +38,27 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 
+import cutlass.cute.nvgpu.cpasync as cpasync
+import cutlass.utils as utils
+import cutlass.pipeline as pipeline
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass.cute.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
+
+from .mla_helpers import (
+    ceil_div,
+    compute_q_tile_layout,
+    MAX_SPLITS,
+    LOG2_E,
+    MLAStaticTileScheduler,
+    MLAStaticTileSchedulerParams,
+    create_mla_static_tile_scheduler,
+    create_mla_static_tile_scheduler_params,
+    get_variable_query_tile_info,
+)
+
+
 # Compat shim: setmaxregister_{decrease,increase} added in cutlass-dsl 4.4;
 # older versions only have the deprecated warpgroup_reg_{dealloc,alloc}.
 _setmaxregister_decrease = getattr(
@@ -64,14 +85,6 @@ def _get_max_tmem_alloc_cols(compute_capability: str) -> int:
     return _TMEM_MAX_ALLOC_COLUMNS_MAP[compute_capability]
 
 
-import cutlass.cute.nvgpu.cpasync as cpasync
-import cutlass.utils as utils
-import cutlass.pipeline as pipeline
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.arch import Arch
-from cutlass.cutlass_dsl import BaseDSL
-
 # ``Arch.sm_107*`` only exists in CuTe DSL >= 4.8; requirements.txt allows 4.7,
 # where a bare attribute access raises AttributeError as soon as this branch is
 # evaluated (SM100 short-circuits before it, SM103 does not).  Fall back to the
@@ -79,18 +92,6 @@ from cutlass.cutlass_dsl import BaseDSL
 _ARCH_SM107 = getattr(Arch, "sm_107", Arch.sm_103f)
 _ARCH_SM107F = getattr(Arch, "sm_107f", Arch.sm_103f)
 
-
-from .mla_helpers import (
-    ceil_div,
-    compute_q_tile_layout,
-    MAX_SPLITS,
-    LOG2_E,
-    MLAStaticTileScheduler,
-    MLAStaticTileSchedulerParams,
-    create_mla_static_tile_scheduler,
-    create_mla_static_tile_scheduler_params,
-    get_variable_query_tile_info,
-)
 
 """
 A Multi-Head Latent Attention (MLA) example using fp8 as input/output for the NVIDIA Blackwell SM100 architecture using CUTE DSL
@@ -257,6 +258,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         self.threads_per_warp = 32
         if reducer_d_tiles not in (1, 2, 4):
             raise ValueError(f"unsupported reducer_d_tiles={reducer_d_tiles}")
+        # Each warp owns a complete reduction row. Group rows only when the
+        # head count divides evenly, so every warp in a CTA has the same
+        # query-validity predicate at the shared-memory barrier.
+        self.reducer_rows_per_cta = 6 if num_heads % 6 == 0 else 1
         self.reducer_d_tiles = reducer_d_tiles
         self.reducer_d_tile = self.latent_dim // reducer_d_tiles
         mma_qk_tiler_k = self.rope_dim * 2
@@ -1035,12 +1040,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 lse_scale,
             ).launch(
                 grid=(
-                    o_unpacked.shape[0] * self.reducer_d_tiles,
+                    o_unpacked.shape[0]
+                    * self.reducer_d_tiles
+                    // self.reducer_rows_per_cta,
                     self.seq_len_q,
                     runtime_batch_size,
                 ),
-                block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
-                smem=self.reducer_max_splits * self.acc_dtype.width // 8,
+                block=[self.threads_per_warp * self.reducer_rows_per_cta, 1, 1],
+                smem=self.reducer_rows_per_cta
+                * self.reducer_max_splits
+                * self.acc_dtype.width
+                // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
                 use_pdl=self.enable_pdl,
@@ -1989,6 +1999,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
+        # Map each warp to its own (head, output-D tile), and use lane IDs
+        # for both the split-weight reduction and the output accumulation.
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        tidx = tidx % self.threads_per_warp
+        bidx = bidx * self.reducer_rows_per_cta + warp_idx
         d_tile_idx = bidx % self.reducer_d_tiles
         head_idx = bidx // self.reducer_d_tiles
         q_begin = cutlass.Int32(0)
@@ -2007,10 +2022,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Inactive compact rows still complete the PDL protocol, but do not
         # touch workspace or enter the active-row shared-memory barrier.
         smem = utils.SmemAllocator()
-        storage = smem.allocate(self.reducer_max_splits * self.acc_dtype.width // 8, 16)
+        storage = smem.allocate(
+            self.reducer_rows_per_cta
+            * self.reducer_max_splits
+            * self.acc_dtype.width
+            // 8,
+            16,
+        )
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
+        # Warp-private weight arrays prevent neighboring rows from sharing
+        # normalization metadata; the existing CTA barrier orders all stores.
         smem_lse_scale = cute.make_tensor(
-            lse_scale_ptr, cute.make_layout(self.reducer_max_splits)
+            lse_scale_ptr + warp_idx * self.reducer_max_splits,
+            cute.make_layout(self.reducer_max_splits),
         )
 
         if cutlass.const_expr(self.enable_pdl):
@@ -2035,70 +2059,68 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
 
             gLSE = mAccLSE[q_tile_row, None, q_tile, bidz]
-            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-            if warp_idx == 0:
-                lse_per_thread = cute.ceil_div(
-                    self.reducer_max_splits, self.threads_per_warp
+            lse_per_thread = cute.ceil_div(
+                self.reducer_max_splits, self.threads_per_warp
+            )
+            local_lse = cute.make_rmem_tensor(
+                cute.make_layout(lse_per_thread), self.lse_dtype
+            )
+            lse_max = -self.lse_dtype.inf
+            for i in cutlass.range_constexpr(lse_per_thread):
+                split_kv_idx = tidx + i * self.threads_per_warp
+                local_lse[i] = (
+                    gLSE[split_kv_idx]
+                    if cute.elem_less(split_kv_idx, local_split_kv)
+                    else -self.lse_dtype.inf
                 )
-                local_lse = cute.make_rmem_tensor(
-                    cute.make_layout(lse_per_thread), self.lse_dtype
+                lse_max = cute.arch.fmax(lse_max, local_lse[i])
+            lse_max = cute.arch.warp_reduction_max(lse_max)
+            if cutlass.const_expr(self.enable_dcp):
+                has_valid_lse = lse_max != -self.lse_dtype.inf
+                lse_max = lse_max if has_valid_lse else 0.0
+            else:
+                lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
+            sum_lse = 0.0
+            for i in cutlass.range_constexpr(lse_per_thread):
+                sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
+            sum_lse = cute.arch.warp_reduction_sum(sum_lse)
+            if cutlass.const_expr(self.enable_dcp):
+                global_lse = (
+                    lse_max + cute.math.log2(sum_lse, fastmath=True)
+                    if has_valid_lse
+                    else -self.lse_dtype.inf
                 )
-                lse_max = -self.lse_dtype.inf
-                for i in cutlass.range_constexpr(lse_per_thread):
-                    split_kv_idx = tidx + i * self.threads_per_warp
-                    local_lse[i] = (
-                        gLSE[split_kv_idx]
-                        if cute.elem_less(split_kv_idx, local_split_kv)
-                        else -self.lse_dtype.inf
-                    )
-                    lse_max = cute.arch.fmax(lse_max, local_lse[i])
-                lse_max = cute.arch.warp_reduction_max(lse_max)
-                if cutlass.const_expr(self.enable_dcp):
-                    has_valid_lse = lse_max != -self.lse_dtype.inf
-                    lse_max = lse_max if has_valid_lse else 0.0
-                else:
-                    lse_max = lse_max if lse_max != -self.lse_dtype.inf else 0.0
-                sum_lse = 0.0
-                for i in cutlass.range_constexpr(lse_per_thread):
-                    sum_lse += cute.math.exp2(local_lse[i] - lse_max, fastmath=True)
-                sum_lse = cute.arch.warp_reduction_sum(sum_lse)
-                if cutlass.const_expr(self.enable_dcp):
-                    global_lse = (
-                        lse_max + cute.math.log2(sum_lse, fastmath=True)
-                        if has_valid_lse
-                        else -self.lse_dtype.inf
-                    )
-                else:
-                    global_lse = (
-                        lse_max + cute.math.log2(sum_lse, fastmath=True)
-                        if sum_lse != self.lse_dtype(0.0) or sum_lse != sum_lse
-                        else self.lse_dtype.inf
-                    )
-                if d_tile_idx == 0:
-                    if tidx == 0:
-                        if cutlass.const_expr(self.is_var_q):
-                            mLSE[head_idx, q_begin + bidy] = global_lse * lse_scale
-                        else:
-                            mLSE[head_idx, bidy, bidz] = global_lse * lse_scale
-                for i in cutlass.range_constexpr(lse_per_thread):
-                    split_kv_idx = tidx + i * self.threads_per_warp
-                    if cute.elem_less(split_kv_idx, local_split_kv):
-                        if cutlass.const_expr(self.enable_dcp):
-                            smem_lse_scale[split_kv_idx] = (
-                                cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
-                                if has_valid_lse
-                                else self.acc_dtype(0.0)
-                            )
-                        else:
-                            smem_lse_scale[split_kv_idx] = cute.math.exp2(
-                                local_lse[i] - global_lse, fastmath=True
-                            )
+            else:
+                global_lse = (
+                    lse_max + cute.math.log2(sum_lse, fastmath=True)
+                    if sum_lse != self.lse_dtype(0.0) or sum_lse != sum_lse
+                    else self.lse_dtype.inf
+                )
+            if d_tile_idx == 0:
+                if tidx == 0:
+                    if cutlass.const_expr(self.is_var_q):
+                        mLSE[head_idx, q_begin + bidy] = global_lse * lse_scale
+                    else:
+                        mLSE[head_idx, bidy, bidz] = global_lse * lse_scale
+            for i in cutlass.range_constexpr(lse_per_thread):
+                split_kv_idx = tidx + i * self.threads_per_warp
+                if cute.elem_less(split_kv_idx, local_split_kv):
+                    if cutlass.const_expr(self.enable_dcp):
+                        smem_lse_scale[split_kv_idx] = (
+                            cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
+                            if has_valid_lse
+                            else self.acc_dtype(0.0)
+                        )
+                    else:
+                        smem_lse_scale[split_kv_idx] = cute.math.exp2(
+                            local_lse[i] - global_lse, fastmath=True
+                        )
 
             pipeline.sync(barrier_id=4)
 
             elements_per_thread = cute.ceil_div(
                 self.reducer_d_tile,
-                self.threads_per_warp * self.num_compute_warps,
+                self.threads_per_warp,
             )
             gAccO = mAccO[q_tile_row, None, None, q_tile, bidz]
             rAccO = cute.make_rmem_tensor(
@@ -2113,15 +2135,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     element_idx = (
                         d_tile_idx * self.reducer_d_tile
                         + tidx
-                        + j * self.threads_per_warp * self.num_compute_warps
+                        + j * self.threads_per_warp
                     )
                     rAccO[j] += gAccO[i, element_idx] * smem_lse_scale[i]
             rO.store(rAccO.load().to(self.o_dtype))
             for j in cutlass.range_constexpr(elements_per_thread):
                 element_idx = (
-                    d_tile_idx * self.reducer_d_tile
-                    + tidx
-                    + j * self.threads_per_warp * self.num_compute_warps
+                    d_tile_idx * self.reducer_d_tile + tidx + j * self.threads_per_warp
                 )
                 if cutlass.const_expr(self.is_var_q):
                     mO[head_idx, element_idx, q_begin + bidy] = rO[j]
@@ -2826,7 +2846,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         if cutlass.const_expr(wait_q):
             load_q_pipeline.consumer_wait(load_q_consumer_state)
         load_k_pipeline.consumer_wait(load_k_consumer_state)
-        for q_stage in range(self.iterations_qk_latent):
+        for q_stage in cutlass.range_constexpr(self.iterations_qk_latent):
             kc_stage = load_k_consumer_state.index
             for k_block in cutlass.range_constexpr(cute.size(qk_params.tSrQ.shape[2])):
                 cute.gemm(
@@ -2838,7 +2858,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 )
                 tiled_mma_qk.set(tcgen05.Field.ACCUMULATE, True)
 
-        for q_stage in range(self.iterations_qk_rope):
+        for q_stage in cutlass.range_constexpr(self.iterations_qk_rope):
             kc_stage = load_k_consumer_state.index
             for k_block in cutlass.range_constexpr(
                 self.rope_dim // tiled_mma_qk.shape_mnk[2]
@@ -3719,6 +3739,13 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         row_max = other_row_max
         row_sum = other_row_sum
 
+        # Retain the previous normalization offset while probabilities remain
+        # at most 16: E4M3 can represent this range without overflow. Decide
+        # before both the sum and output correction so their scales agree,
+        # including the final tile. The first tile still establishes an offset.
+        if (row_max_new - row_max) * softmax_params.softmax_scale_log2 <= 4.0:
+            row_max_new = row_max
+
         # find correction factor (uses inherited row_max from peer = prev global max)
         correction_factor = cute.math.exp2(
             (row_max - row_max_new) * softmax_params.softmax_scale_log2, fastmath=True
@@ -3749,6 +3776,21 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         for i in cutlass.range(cute.size(tTR_rAcc), vectorize=True, unroll_full=True):
             tTR_rAcc[i] = tTR_rAcc[i] * fma_b + fma_c
             tTR_rAcc[i] = cute.math.exp2(tTR_rAcc[i], fastmath=True)
+
+        # row_sum update: tunePerf peer-inheritance pattern.
+        # row_sum entering this block = peer's prev-tile row_sum (the global
+        # running sum BEFORE this tile, inherited via load_other_group_metadata).
+        # Apply correction (rescale prev to new row_max base) and add this tile's
+        # locally reduced exp sum → running_sum_after_this_tile = GLOBAL state.
+        # No cross-group SMEM exchange needed; the next iter's peer-read picks
+        # up this group's freshly written row_sum from TMEM corr.
+        row_sum = row_sum * correction_factor
+        row_sum_vec = (0.0, 0.0)
+        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
+            row_sum_vec = cute.arch.add_packed_f32x2(
+                row_sum_vec, (tTR_rAcc[i], tTR_rAcc[i + 1])
+            )
+        row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
 
         tTR_rS = cute.make_fragment_like(tTR_tS, self.q_dtype)
 
@@ -3799,21 +3841,6 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         cute.arch.fence_view_async_shared()
         softmax_params.p_mma_pipeline.producer_commit(p_mma_producer_state)
         p_mma_producer_state.advance()
-
-        # row_sum update: tunePerf peer-inheritance pattern.
-        # row_sum entering this block = peer's prev-tile row_sum (the global
-        # running sum BEFORE this tile, inherited via load_other_group_metadata).
-        # Apply correction (rescale prev to new row_max base) and add this tile's
-        # locally reduced exp sum → running_sum_after_this_tile = GLOBAL state.
-        # No cross-group SMEM exchange needed; the next iter's peer-read picks
-        # up this group's freshly written row_sum from TMEM corr.
-        row_sum = row_sum * correction_factor
-        row_sum_vec = (0.0, 0.0)
-        for i in cutlass.range_constexpr(0, cute.size(tTR_rAcc), 2):
-            row_sum_vec = cute.arch.add_packed_f32x2(
-                row_sum_vec, (tTR_rAcc[i], tTR_rAcc[i + 1])
-            )
-        row_sum = row_sum_vec[0] + row_sum_vec[1] + row_sum
 
         # Late store of row_sum ONLY — patches in the real row_sum at the slot
         # committed by the early store above so peer's next-iter
